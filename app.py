@@ -5,7 +5,7 @@
 # 1. INSTALL PACKAGES (AUTOMATIC DEPENDENCIES)
 # ==========================================================
 import subprocess, sys
-subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "voxcpm", "soundfile", "gradio", "torch", "numpy", "pydub", "pymongo", "dnspython", "cryptography"])
+subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "--upgrade", "--no-cache-dir", "voxcpm==2.0.3", "soundfile", "gradio", "torch", "numpy", "pydub", "pymongo", "dnspython", "cryptography"])
 
 # ==========================================================
 # 2. SECURE LIVE LICENSE VERIFICATION ENGINE
@@ -24,6 +24,12 @@ from pydub import AudioSegment
 from pymongo import MongoClient
 from pymongo.errors import PyMongoError
 from voxcpm import VoxCPM
+
+try:
+    import importlib.metadata
+    print("✅ VoxCPM package version:", importlib.metadata.version("voxcpm"))
+except Exception:
+    pass
 
 # 🔒 Standard Clean Base64 Token (Database Password ဝှက်ထားခြင်း)
 _SEC_TOKEN = "bW9uZ29kYitzcnY6Ly9teW93aW5obGFpbmcxODRfZGJfdXNlcjp4TmtRMVJhSXYwSUZpRG1PQGNsdXN0ZXIwLnplemhrZ2IubW9uZ29kYi5uZXQvP2FwcE5hbWU9Q2x1c3RlcjA="
