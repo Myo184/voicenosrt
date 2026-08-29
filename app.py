@@ -87,7 +87,6 @@ print("⏳ VoxCPM2 Model ကို GPU ပေါ်သို့ စတင်ဆ�
 model = VoxCPM.from_pretrained("openbmb/VoxCPM2", load_denoiser=False)
 print("✅ VoxCPM2 Model Loaded Successfully (Ready for 30+ Mins Audio)!")
 
-
 def split_burmese_text_long(text, max_chars=90):
     raw_sentences = re.split(r'([။၊\n?!])', text)
     chunks, curr = [], ""
@@ -160,7 +159,6 @@ def generate_vip_long(vip_key, text, control_instruction, reference_audio, use_r
                     cfg_value=float(clone_strength)
                 )
 
-
             audio_segments.append(wav)
             silence_samples = int(model.tts_model.sample_rate * silence_gap)
             audio_segments.append(np.zeros(silence_samples, dtype=np.float32))
@@ -188,7 +186,6 @@ def generate_vip_long(vip_key, text, control_instruction, reference_audio, use_r
     audio_segment.export(output_mp3_path, format="mp3", bitrate="192k")
     if os.path.exists(temp_wav_path):
         os.remove(temp_wav_path)
-
 
     with open(output_mp3_path, "rb") as f:
         mp3_b64 = base64.b64encode(f.read()).decode()
@@ -306,7 +303,7 @@ with gr.Blocks(title="YF TTS · Burmese AI Voice Studio", theme=APP_THEME, css=A
         <div class="feature-row">
             <span class="feature-pill">⚡ GPU Powered</span>
             <span class="feature-pill">🎧 Voice Cloning</span>
-            <span class="feature-pill">🎵 MP3</span>
+            <span class="feature-pill">🎵 MP3 Audio</span>
             <span class="feature-pill">⏱️ Long-form Ready</span>
             <span class="feature-pill">👑 VIP Access</span>
         </div>
