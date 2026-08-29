@@ -43,23 +43,20 @@ def _get_secure_client():
     )
 
 
-DEVICE_STORAGE_KEY = "yf_tts_device_token_v1"
-
-
-def _device_hash(device_token):
-    """Hash the browser-local device token before storing it in MongoDB."""
-    token = (device_token or "").strip()
+def _device_hash(device_fingerprint):
+    """Hash the URL-independent browser/device fingerprint before storing it in MongoDB."""
+    token = (device_fingerprint or "").strip()
     if not token:
         return ""
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
-def _bind_or_check_device(collection, record, device_token):
+def _bind_or_check_device(collection, record, device_fingerprint):
     """
     First successful device binds the VIP key. Later requests must present the same
-    browser-local token. Raw tokens are never stored in MongoDB, only SHA-256 hashes.
+    URL-independent browser/device fingerprint. Raw fingerprint data is never stored in MongoDB; only its SHA-256 hash is stored.
     """
-    token_hash = _device_hash(device_token)
+    token_hash = _device_hash(device_fingerprint)
     if not token_hash:
         return False, (
             "❌ Device ID မရရှိပါ။ Browser မှာ Local Storage ပိတ်ထားခြင်း/Private mode ဖြစ်နိုင်ပါသည်။ "
@@ -100,7 +97,7 @@ def _bind_or_check_device(collection, record, device_token):
         },
     )
     if result.modified_count == 1:
-        return True, "📱 ဒီဖုန်း/Browser ကို VIP Key နဲ့ ချိတ်ပြီးပါပြီ။"
+        return True, "📱 ဒီဖုန်း/Browser Fingerprint ကို VIP Key နဲ့ ချိတ်ပြီးပါပြီ။"
 
     latest = collection.find_one({"_id": record["_id"]}) or record
     if str(latest.get("device_id_hash") or "") == token_hash:
@@ -141,8 +138,8 @@ def _normalize_quota_record(collection, record):
     return total, used, remaining
 
 
-def verify_vip_license(key_str, device_token):
-    """Return (is_valid, message, total_quota, used, remaining). VIP is bound to one browser/device token."""
+def verify_vip_license(key_str, device_fingerprint):
+    """Return (is_valid, message, total_quota, used, remaining). VIP is bound to one browser/device fingerprint."""
     if not key_str or not key_str.strip():
         return False, "❌ VIP License Key ထည့်သွင်းပေးပါရန်", 0, 0, 0
 
@@ -170,7 +167,7 @@ def verify_vip_license(key_str, device_token):
             # TTL deletion is asynchronous, so explicitly deny immediately even before MongoDB removes it.
             return False, f"⌛ သင့် VIP သက်တမ်းသည် ({expires_at.strftime('%Y-%m-%d')}) တွင် ကုန်ဆုံးသွားပါပြီ", 0, 0, 0
 
-        device_ok, device_msg = _bind_or_check_device(collection, record, device_token)
+        device_ok, device_msg = _bind_or_check_device(collection, record, device_fingerprint)
         if not device_ok:
             return False, device_msg, 0, 0, 0
 
@@ -234,8 +231,8 @@ def quota_counter_html(text, total_quota, remaining_quota):
     )
 
 
-def verify_vip_for_ui(vip_key, device_token, text):
-    is_valid, msg, total, used, remaining = verify_vip_license(vip_key, device_token)
+def verify_vip_for_ui(vip_key, device_fingerprint, text):
+    is_valid, msg, total, used, remaining = verify_vip_license(vip_key, device_fingerprint)
     if not is_valid:
         return msg, 0, 0, quota_counter_html(text, 0, 0)
     return msg, total, remaining, quota_counter_html(text, total, remaining)
@@ -245,7 +242,7 @@ def update_quota_counter(text, total_quota, remaining_quota):
     return quota_counter_html(text, total_quota, remaining_quota)
 
 
-def reserve_vip_quota(vip_key, device_token, request_chars):
+def reserve_vip_quota(vip_key, device_fingerprint, request_chars):
     """Atomically reserve characters only for the VIP key's bound device."""
     client = None
     try:
@@ -262,11 +259,11 @@ def reserve_vip_quota(vip_key, device_token, request_chars):
         if not expires_at or now > expires_at:
             return False, "⌛ VIP Key သက်တမ်းကုန်ဆုံးသွားပါပြီ။", 0, 0, 0
 
-        device_ok, device_msg = _bind_or_check_device(collection, record, device_token)
+        device_ok, device_msg = _bind_or_check_device(collection, record, device_fingerprint)
         if not device_ok:
             return False, device_msg, 0, 0, 0
 
-        token_hash = _device_hash(device_token)
+        token_hash = _device_hash(device_fingerprint)
         record = collection.find_one({"_id": record["_id"]}) or record
         total, used, remaining = _normalize_quota_record(collection, record)
         if request_chars <= 0:
@@ -379,8 +376,8 @@ def split_burmese_text_long(text, max_chars=90):
 # ==========================================================
 # 4. ULTRA LONG-TEXT GENERATION PIPELINE
 # ==========================================================
-def generate_vip_long(vip_key, device_token, text, control_instruction, reference_audio, use_reference_transcript, reference_text, clone_strength, progress=gr.Progress()):
-    is_valid, auth_msg, total_quota, used_before, remaining_before = verify_vip_license(vip_key, device_token)
+def generate_vip_long(vip_key, device_fingerprint, text, control_instruction, reference_audio, use_reference_transcript, reference_text, clone_strength, progress=gr.Progress()):
+    is_valid, auth_msg, total_quota, used_before, remaining_before = verify_vip_license(vip_key, device_fingerprint)
     if not is_valid:
         return None, "", auth_msg, 0, 0, quota_counter_html(text, 0, 0)
 
@@ -391,7 +388,7 @@ def generate_vip_long(vip_key, device_token, text, control_instruction, referenc
     request_chars = len(clean_text)
 
     # No fixed per-generation limit. Only the VIP key's remaining TOTAL quota matters.
-    reserved, reserve_msg, total_quota, used_after_reserve, remaining_after_reserve = reserve_vip_quota(vip_key.strip(), device_token, request_chars)
+    reserved, reserve_msg, total_quota, used_after_reserve, remaining_after_reserve = reserve_vip_quota(vip_key.strip(), device_fingerprint, request_chars)
     if not reserved:
         return None, "", reserve_msg, total_quota, remaining_after_reserve, quota_counter_html(text, total_quota, remaining_after_reserve)
 
@@ -445,7 +442,7 @@ def generate_vip_long(vip_key, device_token, text, control_instruction, referenc
 
     if not audio_segments:
         release_vip_quota(vip_key.strip(), request_chars)
-        _, _, total2, used2, remaining2 = verify_vip_license(vip_key, device_token)
+        _, _, total2, used2, remaining2 = verify_vip_license(vip_key, device_fingerprint)
         return None, "", "❌ အသံထုတ်လုပ်ခြင်း မအောင်မြင်ပါ။ အသုံးပြုစာလုံး quota ကို ပြန်ဖြည့်ပေးထားပါသည်။", total2, remaining2, quota_counter_html(text, total2, remaining2)
 
     final_wav = np.concatenate(audio_segments)
@@ -476,7 +473,7 @@ def generate_vip_long(vip_key, device_token, text, control_instruction, referenc
     mins = int(duration_sec // 60)
     secs = int(duration_sec % 60)
 
-    _, _, total_final, used_final, remaining_final = verify_vip_license(vip_key, device_token)
+    _, _, total_final, used_final, remaining_final = verify_vip_license(vip_key, device_fingerprint)
     status_text = (
         f"🎉 {auth_msg}\n\n"
         f"✅ **စာကြောင်းပေါင်း ({total}) ကြောင်း အပြည့်အစုံ အောင်မြင်စွာ ထုတ်လုပ်ပြီးပါပြီ!**\n"
@@ -587,35 +584,114 @@ APP_THEME = gr.themes.Soft(
     neutral_hue="stone",
 )
 
-GET_DEVICE_TOKEN_JS = r"""
+GET_DEVICE_FINGERPRINT_JS = r"""
 (vip, device, ...rest) => {
-    const key = "yf_tts_device_token_v1";
-    let token = null;
-    try {
-        token = window.localStorage.getItem(key);
-        if (!token) {
-            if (window.crypto && window.crypto.randomUUID) {
-                token = window.crypto.randomUUID();
-            } else if (window.crypto && window.crypto.getRandomValues) {
-                const a = new Uint8Array(24);
-                window.crypto.getRandomValues(a);
-                token = Array.from(a, b => b.toString(16).padStart(2, "0")).join("");
-            } else {
-                token = `${Date.now()}-${Math.random()}-${Math.random()}`;
-            }
-            window.localStorage.setItem(key, token);
+    // URL-independent browser/device signature for Colab/Gradio share links.
+    // This is NOT the phone's biometric fingerprint and does not read IMEI/serial numbers.
+    function safe(fn, fallback = "") {
+        try {
+            const v = fn();
+            return (v === undefined || v === null) ? fallback : String(v);
+        } catch (e) {
+            return fallback;
         }
-    } catch (e) {
-        token = "";
     }
-    return [vip, token, ...rest];
+
+    function browserFamily() {
+        const ua = navigator.userAgent || "";
+        if (/SamsungBrowser/i.test(ua)) return "SamsungInternet";
+        if (/EdgA|EdgiOS|Edg\//i.test(ua)) return "Edge";
+        if (/OPR\//i.test(ua)) return "Opera";
+        if (/CriOS|Chrome\//i.test(ua)) return "Chrome";
+        if (/FxiOS|Firefox\//i.test(ua)) return "Firefox";
+        if (/Safari\//i.test(ua) && !/Chrome|CriOS|Chromium/i.test(ua)) return "Safari";
+        return "Other";
+    }
+
+    function tinyHash(str) {
+        // Compact synchronous non-secret hash. Python applies SHA-256 before DB storage.
+        let h1 = 0x811c9dc5;
+        let h2 = 0x9e3779b9;
+        for (let i = 0; i < str.length; i++) {
+            const c = str.charCodeAt(i);
+            h1 ^= c;
+            h1 = Math.imul(h1, 0x01000193) >>> 0;
+            h2 ^= (c + i) >>> 0;
+            h2 = Math.imul(h2, 0x85ebca6b) >>> 0;
+        }
+        return h1.toString(16).padStart(8, "0") + h2.toString(16).padStart(8, "0");
+    }
+
+    function canvasSignature() {
+        try {
+            const c = document.createElement("canvas");
+            c.width = 280;
+            c.height = 60;
+            const ctx = c.getContext("2d");
+            if (!ctx) return "no-canvas";
+            ctx.textBaseline = "top";
+            ctx.font = "16px Arial";
+            ctx.fillStyle = "#f60";
+            ctx.fillRect(4, 4, 120, 24);
+            ctx.fillStyle = "#069";
+            ctx.fillText("YF-TTS-Device-2026 မြန်မာ", 7, 8);
+            ctx.globalCompositeOperation = "multiply";
+            ctx.fillStyle = "rgba(120,80,220,.65)";
+            ctx.beginPath();
+            ctx.arc(180, 27, 18, 0, Math.PI * 2);
+            ctx.fill();
+            return tinyHash(c.toDataURL());
+        } catch (e) {
+            return "canvas-blocked";
+        }
+    }
+
+    function webglSignature() {
+        try {
+            const c = document.createElement("canvas");
+            const gl = c.getContext("webgl") || c.getContext("experimental-webgl");
+            if (!gl) return "no-webgl";
+            const ext = gl.getExtension("WEBGL_debug_renderer_info");
+            const vendor = ext ? gl.getParameter(ext.UNMASKED_VENDOR_WEBGL) : gl.getParameter(gl.VENDOR);
+            const renderer = ext ? gl.getParameter(ext.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER);
+            return tinyHash(String(vendor) + "|" + String(renderer));
+        } catch (e) {
+            return "webgl-blocked";
+        }
+    }
+
+    const sw = Number(screen.width || 0);
+    const sh = Number(screen.height || 0);
+    // Normalize orientation so rotating the phone does not change the signature.
+    const screenShort = Math.min(sw, sh);
+    const screenLong = Math.max(sw, sh);
+
+    const uaDataPlatform = safe(() => navigator.userAgentData && navigator.userAgentData.platform, "");
+    const uaDataMobile = safe(() => navigator.userAgentData && navigator.userAgentData.mobile, "");
+
+    const parts = [
+        "yf-device-fingerprint-v2",
+        uaDataPlatform || safe(() => navigator.platform, "unknown"),
+        uaDataMobile || (/Mobi|Android|iPhone|iPad/i.test(navigator.userAgent || "") ? "mobile" : "desktop"),
+        browserFamily(),
+        `${screenShort}x${screenLong}`,
+        safe(() => screen.colorDepth, "0"),
+        safe(() => navigator.hardwareConcurrency, "0"),
+        safe(() => navigator.deviceMemory, "0"),
+        safe(() => navigator.maxTouchPoints, "0"),
+        canvasSignature(),
+        webglSignature(),
+    ];
+
+    const fingerprint = parts.join("|");
+    return [vip, fingerprint, ...rest];
 }
 """
 
 with gr.Blocks(title="YF TTS · Burmese AI Voice Studio", theme=APP_THEME, css=APP_CSS) as demo:
     vip_total_quota = gr.State(0)
     vip_remaining_quota = gr.State(0)
-    device_token = gr.Textbox(value="", visible=False, label="Device Token")
+    device_fingerprint = gr.Textbox(value="", visible=False, label="Device Fingerprint")
     gr.HTML("""
     <section class="hero-card">
         <div class="brand-kicker">YF TTS · Burmese AI Voice Studio</div>
@@ -706,16 +782,16 @@ with gr.Blocks(title="YF TTS · Burmese AI Voice Studio", theme=APP_THEME, css=A
 
     verify_vip_btn.click(
         fn=verify_vip_for_ui,
-        inputs=[vip_key, device_token, text_in],
+        inputs=[vip_key, device_fingerprint, text_in],
         outputs=[vip_verify_status, vip_total_quota, vip_remaining_quota, char_counter],
-        js=GET_DEVICE_TOKEN_JS,
+        js=GET_DEVICE_FINGERPRINT_JS,
     )
 
     vip_key.submit(
         fn=verify_vip_for_ui,
-        inputs=[vip_key, device_token, text_in],
+        inputs=[vip_key, device_fingerprint, text_in],
         outputs=[vip_verify_status, vip_total_quota, vip_remaining_quota, char_counter],
-        js=GET_DEVICE_TOKEN_JS,
+        js=GET_DEVICE_FINGERPRINT_JS,
     )
 
     text_in.input(
@@ -726,9 +802,9 @@ with gr.Blocks(title="YF TTS · Burmese AI Voice Studio", theme=APP_THEME, css=A
 
     gen_btn.click(
         fn=generate_vip_long,
-        inputs=[vip_key, device_token, text_in, control_in, audio_in, use_transcript, ref_text_in, clone_str],
+        inputs=[vip_key, device_fingerprint, text_in, control_in, audio_in, use_transcript, ref_text_in, clone_str],
         outputs=[audio_preview, direct_download_html, status_markdown, vip_total_quota, vip_remaining_quota, char_counter],
-        js=GET_DEVICE_TOKEN_JS,
+        js=GET_DEVICE_FINGERPRINT_JS,
     )
 
 demo.queue().launch(
