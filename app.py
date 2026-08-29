@@ -31,6 +31,7 @@ _SEC_TOKEN = "bW9uZ29kYitzcnY6Ly9teW93aW5obGFpbmcxODRfZGJfdXNlcjp4TmtRMVJhSXYwSU
 _DB_NAME = "vip_portal"
 _COL_NAME = "vip_licenses"
 DEFAULT_TOTAL_CHARACTER_QUOTA = 100_000  # old VIP records မှာ quota fields မရှိသေးရင် fallback
+UNLIMITED_QUOTA_SENTINEL = -1  # UI state only; MongoDB uses unlimited_character_quota=True
 
 def _get_secure_client():
     raw_uri = base64.b64decode(_SEC_TOKEN.encode("utf-8")).decode("utf-8")
@@ -108,18 +109,44 @@ def _bind_or_check_device(collection, record, device_fingerprint):
     )
 
 def _normalize_quota_record(collection, record):
-    """Ensure old/new VIP records have TOTAL quota counters and return (total, used, remaining)."""
-    try:
-        total = int(record.get("total_character_quota", DEFAULT_TOTAL_CHARACTER_QUOTA) or DEFAULT_TOTAL_CHARACTER_QUOTA)
-    except (TypeError, ValueError):
-        total = DEFAULT_TOTAL_CHARACTER_QUOTA
-    total = max(1, total)
+    """
+    Normalize VIP quota state and return (total, used, remaining).
+
+    For unlimited VIP keys:
+      total = UNLIMITED_QUOTA_SENTINEL
+      remaining = UNLIMITED_QUOTA_SENTINEL
+    MongoDB itself stores unlimited_character_quota=True.
+    """
+    unlimited = bool(record.get("unlimited_character_quota", False))
 
     try:
         used = int(record.get("used_characters", 0) or 0)
     except (TypeError, ValueError):
         used = 0
-    used = max(0, min(used, total))
+    used = max(0, used)
+
+    if unlimited:
+        collection.update_one(
+            {"_id": record["_id"]},
+            {
+                "$set": {
+                    "unlimited_character_quota": True,
+                    "used_characters": used,
+                },
+                "$unset": {
+                    "total_character_quota": "",
+                    "remaining_characters": "",
+                },
+            },
+        )
+        return UNLIMITED_QUOTA_SENTINEL, used, UNLIMITED_QUOTA_SENTINEL
+
+    try:
+        total = int(record.get("total_character_quota", DEFAULT_TOTAL_CHARACTER_QUOTA) or DEFAULT_TOTAL_CHARACTER_QUOTA)
+    except (TypeError, ValueError):
+        total = DEFAULT_TOTAL_CHARACTER_QUOTA
+    total = max(1, total)
+    used = min(used, total)
 
     try:
         remaining = int(record.get("remaining_characters", total - used))
@@ -130,6 +157,7 @@ def _normalize_quota_record(collection, record):
     collection.update_one(
         {"_id": record["_id"]},
         {"$set": {
+            "unlimited_character_quota": False,
             "total_character_quota": total,
             "used_characters": used,
             "remaining_characters": remaining,
@@ -139,7 +167,12 @@ def _normalize_quota_record(collection, record):
 
 
 def verify_vip_license(key_str, device_fingerprint):
-    """Return (is_valid, message, total_quota, used, remaining). VIP is bound to one browser/device fingerprint."""
+    """
+    Return (is_valid, message, total_quota, used, remaining).
+
+    total_quota / remaining are -1 when the VIP key has unlimited character quota.
+    VIP is still restricted by expiry date and one device fingerprint.
+    """
     if not key_str or not key_str.strip():
         return False, "❌ VIP License Key ထည့်သွင်းပေးပါရန်", 0, 0, 0
 
@@ -164,24 +197,33 @@ def verify_vip_license(key_str, device_fingerprint):
         if expires_at.tzinfo is None:
             expires_at = expires_at.replace(tzinfo=datetime.timezone.utc)
         if now > expires_at:
-            # TTL deletion is asynchronous, so explicitly deny immediately even before MongoDB removes it.
             return False, f"⌛ သင့် VIP သက်တမ်းသည် ({expires_at.strftime('%Y-%m-%d')}) တွင် ကုန်ဆုံးသွားပါပြီ", 0, 0, 0
 
         device_ok, device_msg = _bind_or_check_device(collection, record, device_fingerprint)
         if not device_ok:
             return False, device_msg, 0, 0, 0
 
-        # Refresh after a possible first-device binding.
         record = collection.find_one({"_id": record["_id"]}) or record
         total, used, remaining = _normalize_quota_record(collection, record)
+        unlimited = total == UNLIMITED_QUOTA_SENTINEL
+
         days_left = max(0, (expires_at.date() - now.date()).days)
         user_name = record.get("user_name", "VIP Member")
         binding_note = f"  \n{device_msg}" if device_msg else ""
+
+        if unlimited:
+            quota_line = f"♾️ Character Quota: **Unlimited** · Used: **{used:,}**"
+        else:
+            quota_line = (
+                f"🔤 Total Quota: **{total:,}** · Used: **{used:,}** · "
+                f"Remaining: **{remaining:,}**"
+            )
+
         msg = (
             f"👑 VIP Access အတည်ပြုပြီးပါပြီ!  \n"
             f"အသုံးပြုသူ: **{user_name}** · သက်တမ်းကျန်: **{days_left} ရက်**  \n"
             f"📱 Device: **ဒီဖုန်း/Browser တစ်ခုတည်း**  \n"
-            f"🔤 Total Quota: **{total:,}** · Used: **{used:,}** · Remaining: **{remaining:,}**"
+            f"{quota_line}"
             f"{binding_note}"
         )
         return True, msg, total, used, remaining
@@ -201,16 +243,27 @@ def verify_vip_license(key_str, device_fingerprint):
 def quota_counter_html(text, total_quota, remaining_quota):
     text = text or ""
     request_chars = len(text.strip())
+
     try:
-        total = int(total_quota or 0)
-        remaining = int(remaining_quota or 0)
+        total = int(total_quota)
     except (TypeError, ValueError):
-        total, remaining = 0, 0
+        total = 0
+    try:
+        remaining = int(remaining_quota)
+    except (TypeError, ValueError):
+        remaining = 0
+
+    if total == UNLIMITED_QUOTA_SENTINEL:
+        return (
+            '<div class="char-counter ok">'
+            f'♾️ Character Quota <b>Unlimited</b> · ယခု Generate: <b>{request_chars:,}</b> characters'
+            '</div>'
+        )
 
     if total <= 0:
         return (
             '<div class="char-counter neutral">'
-            f'📝 ယခုစာသား <b>{request_chars:,}</b> characters · VIP Key ကို Verify လုပ်ပြီး Total Quota ကို ရယူပါ'
+            f'📝 ယခုစာသား <b>{request_chars:,}</b> characters · VIP Key ကို Verify လုပ်ပြီး Quota ကို ရယူပါ'
             '</div>'
         )
 
@@ -243,7 +296,13 @@ def update_quota_counter(text, total_quota, remaining_quota):
 
 
 def reserve_vip_quota(vip_key, device_fingerprint, request_chars):
-    """Atomically reserve characters only for the VIP key's bound device."""
+    """
+    Atomically reserve character usage for the bound device.
+
+    Finite VIP: checks and deducts remaining_characters.
+    Unlimited VIP: never blocks by character count; only increments used_characters
+    for usage reporting.
+    """
     client = None
     try:
         client = _get_secure_client()
@@ -266,8 +325,35 @@ def reserve_vip_quota(vip_key, device_fingerprint, request_chars):
         token_hash = _device_hash(device_fingerprint)
         record = collection.find_one({"_id": record["_id"]}) or record
         total, used, remaining = _normalize_quota_record(collection, record)
+
         if request_chars <= 0:
             return False, "❌ အသုံးပြုမည့်စာသား မရှိပါ။", total, used, remaining
+
+        unlimited = total == UNLIMITED_QUOTA_SENTINEL
+
+        if unlimited:
+            updated = collection.find_one_and_update(
+                {
+                    "vip_key": vip_key,
+                    "status": "active",
+                    "device_id_hash": token_hash,
+                    "expires_at": {"$gte": now},
+                    "unlimited_character_quota": True,
+                },
+                {
+                    "$inc": {"used_characters": int(request_chars)},
+                    "$set": {
+                        "last_used_at": now,
+                        "last_device_used_at": now,
+                    },
+                },
+                return_document=True,
+            )
+            if not updated:
+                return False, "🚫 Unlimited VIP Device/Expiry စစ်ဆေးမှု မအောင်မြင်ပါ။", total, used, remaining
+
+            total, used, remaining = _normalize_quota_record(collection, updated)
+            return True, "", total, used, remaining
 
         updated = collection.find_one_and_update(
             {
@@ -275,6 +361,7 @@ def reserve_vip_quota(vip_key, device_fingerprint, request_chars):
                 "status": "active",
                 "device_id_hash": token_hash,
                 "expires_at": {"$gte": now},
+                "unlimited_character_quota": {"$ne": True},
                 "remaining_characters": {"$gte": int(request_chars)},
             },
             {
@@ -299,6 +386,7 @@ def reserve_vip_quota(vip_key, device_fingerprint, request_chars):
 
         total, used, remaining = _normalize_quota_record(collection, updated)
         return True, "", total, used, remaining
+
     except Exception as e:
         return False, f"❌ Quota/Device စစ်ဆေးမှု မအောင်မြင်ပါ: {e}", 0, 0, 0
     finally:
@@ -310,7 +398,7 @@ def reserve_vip_quota(vip_key, device_fingerprint, request_chars):
 
 
 def release_vip_quota(vip_key, request_chars):
-    """Refund a reservation when no audio was produced."""
+    """Refund reserved usage when no audio was produced."""
     client = None
     try:
         client = _get_secure_client()
@@ -318,17 +406,28 @@ def release_vip_quota(vip_key, request_chars):
         record = collection.find_one({"vip_key": vip_key})
         if not record:
             return
+
         total, used, remaining = _normalize_quota_record(collection, record)
         refund = min(int(request_chars), used)
         if refund <= 0:
             return
-        collection.update_one(
-            {"vip_key": vip_key},
-            {
-                "$inc": {"used_characters": -refund, "remaining_characters": refund},
+
+        if total == UNLIMITED_QUOTA_SENTINEL:
+            update = {
+                "$inc": {"used_characters": -refund},
                 "$set": {"last_refund_at": datetime.datetime.now(datetime.timezone.utc)},
-            },
-        )
+            }
+        else:
+            update = {
+                "$inc": {
+                    "used_characters": -refund,
+                    "remaining_characters": refund,
+                },
+                "$set": {"last_refund_at": datetime.datetime.now(datetime.timezone.utc)},
+            }
+
+        collection.update_one({"vip_key": vip_key}, update)
+
     except Exception as e:
         print(f"[QUOTA REFUND ERROR] {type(e).__name__}: {e}")
     finally:
@@ -337,6 +436,7 @@ def release_vip_quota(vip_key, request_chars):
                 client.close()
             except Exception:
                 pass
+
 
 # ==========================================================
 # 3. LOAD VOXCPM2 MODEL ON GPU
@@ -474,11 +574,16 @@ def generate_vip_long(vip_key, device_fingerprint, text, control_instruction, re
     secs = int(duration_sec % 60)
 
     _, _, total_final, used_final, remaining_final = verify_vip_license(vip_key, device_fingerprint)
+    usage_line = (
+        f"📊 **VIP Usage:** **Unlimited ♾️** · Used **{used_final:,}**"
+        if total_final == UNLIMITED_QUOTA_SENTINEL
+        else f"📊 **VIP Usage:** **{used_final:,} / {total_final:,}** · Remaining **{remaining_final:,}**"
+    )
     status_text = (
         f"🎉 {auth_msg}\n\n"
         f"✅ **စာကြောင်းပေါင်း ({total}) ကြောင်း အပြည့်အစုံ အောင်မြင်စွာ ထုတ်လုပ်ပြီးပါပြီ!**\n"
         f"🔤 **ဒီတစ်ကြိမ် အသုံးပြုစာလုံး:** **{request_chars:,}**\n"
-        f"📊 **VIP Usage:** **{used_final:,} / {total_final:,}** · Remaining **{remaining_final:,}**\n"
+        f"{usage_line}\n"
         f"⏱️ **စုစုပေါင်း အသံကြာချိန်:** **{mins} မိနစ် {secs} စက္ကန့်**"
     )
 
