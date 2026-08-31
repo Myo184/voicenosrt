@@ -504,6 +504,13 @@ print("⏳ VoxCPM2 Model ကို GPU ပေါ်သို့ စတင်ဆ�
 model = VoxCPM.from_pretrained("openbmb/VoxCPM2", load_denoiser=False)
 print("✅ VoxCPM2 Model Loaded Successfully (Ready for 30+ Mins Audio)!")
 
+def format_srt_time(seconds):
+    millis = int(seconds * 1000)
+    hours, millis = divmod(millis, 3600000)
+    minutes, millis = divmod(millis, 60000)
+    secs, millis = divmod(millis, 1000)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
+
 def split_burmese_text_long(text, max_chars=90):
     raw_sentences = re.split(r'([။၊\n?!])', text)
     chunks, curr = [], ""
@@ -546,14 +553,16 @@ def generate_vip_long(vip_key, device_fingerprint, text, control_instruction, re
     if not reserved:
         return None, "", reserve_msg, total_quota, remaining_after_reserve, quota_counter_html(text, total_quota, remaining_after_reserve)
 
-    job_id = _new_usage_job(vip_key.strip(), device_fingerprint, request_chars, "MP3")
+    job_id = _new_usage_job(vip_key.strip(), device_fingerprint, request_chars, "MP3+SRT")
     started = time.time()
     try:
         chunks = split_burmese_text_long(clean_text, max_chars=90) or [clean_text]
         prompt_text = reference_text if (use_reference_transcript and reference_text) else None
-        audio_segments, silence_gap = [], 0.15
+        audio_segments, subtitles = [], []
+        current_time, silence_gap = 0.0, 0.15
         total = len(chunks)
         start_all = time.time()
+
         for idx, chunk in enumerate(chunks):
             pct = (idx + 1) / total
             elapsed = time.time() - start_all
@@ -566,6 +575,9 @@ def generate_vip_long(vip_key, device_fingerprint, text, control_instruction, re
                     wav = model.generate(text=full_chunk_text, prompt_wav_path=reference_audio, prompt_text=prompt_text, reference_wav_path=reference_audio, cfg_value=float(clone_strength))
                 else:
                     wav = model.generate(text=full_chunk_text, reference_wav_path=reference_audio, cfg_value=float(clone_strength))
+                chunk_dur = len(wav) / model.tts_model.sample_rate
+                subtitles.append({"start": current_time, "end": current_time + chunk_dur, "text": chunk.strip()})
+                current_time += chunk_dur + silence_gap
                 audio_segments.append(wav)
                 audio_segments.append(np.zeros(int(model.tts_model.sample_rate * silence_gap), dtype=np.float32))
                 if idx % 10 == 0:
@@ -574,8 +586,10 @@ def generate_vip_long(vip_key, device_fingerprint, text, control_instruction, re
             except Exception as chunk_error:
                 print(f"Chunk #{idx+1} Error: {chunk_error}")
                 continue
+
         if not audio_segments:
             raise RuntimeError("Audio chunk တစ်ခုမှ အောင်မြင်စွာ မထွက်ပါ။")
+
         final_wav = np.concatenate(audio_segments)
         ts = int(time.time() * 1000)
         temp_wav_path = f"temp_{ts}.wav"
@@ -583,15 +597,57 @@ def generate_vip_long(vip_key, device_fingerprint, text, control_instruction, re
         output_mp3_path = f"cloned_voice_{ts}.mp3"
         AudioSegment.from_wav(temp_wav_path).export(output_mp3_path, format="mp3", bitrate="192k")
         if os.path.exists(temp_wav_path): os.remove(temp_wav_path)
+
+        # ----------------------------------------------------------
+        # CapCut-compatible SRT
+        # ----------------------------------------------------------
+        # Use real CRLF line endings (not literal "\\n") and plain UTF-8.
+        srt_blocks = []
+        for i, sub in enumerate(subtitles, 1):
+            subtitle_text = str(sub["text"]).replace("\r\n", "\n").replace("\r", "\n").strip()
+            subtitle_text = "\n".join(
+                line.strip() for line in subtitle_text.split("\n") if line.strip()
+            )
+            if not subtitle_text:
+                continue
+
+            start_time = format_srt_time(max(0.0, float(sub["start"])))
+            end_time = format_srt_time(
+                max(float(sub["end"]), float(sub["start"]) + 0.001)
+            )
+
+            subtitle_text_crlf = subtitle_text.replace("\n", "\r\n")
+            srt_blocks.append(
+                f"{len(srt_blocks) + 1}\r\n"
+                f"{start_time} --> {end_time}\r\n"
+                f"{subtitle_text_crlf}"
+            )
+
+        srt_content = "\r\n\r\n".join(srt_blocks) + "\r\n"
+
+        # Save a real SRT file as UTF-8 without BOM.
+        output_srt_path = f"Long_Subtitle_{ts}.srt"
+        with open(output_srt_path, "w", encoding="utf-8", newline="") as srt_file:
+            srt_file.write(srt_content)
+
         with open(output_mp3_path, "rb") as f:
             mp3_b64 = base64.b64encode(f.read()).decode()
-        download_buttons_html = f'''<div style="display:flex;gap:12px;margin-top:15px;"><a href="data:audio/mp3;base64,{mp3_b64}" download="Long_Voice_{ts}.mp3" style="background:#8B5CF6;color:white;padding:12px 20px;border-radius:8px;text-decoration:none;font-weight:bold;">📥 MP3 Download</a></div>'''
+
+        with open(output_srt_path, "rb") as f:
+            srt_b64 = base64.b64encode(f.read()).decode()
+
+        download_buttons_html = f'''<div style="display:flex;flex-wrap:wrap;gap:12px;margin-top:15px;">
+        <a href="data:audio/mp3;base64,{mp3_b64}" download="Long_Voice_{ts}.mp3" style="background:#8B5CF6;color:white;padding:12px 20px;border-radius:8px;text-decoration:none;font-weight:bold;">📥 MP3 Download</a>
+        <a href="data:application/x-subrip;base64,{srt_b64}" download="Long_Subtitle_{ts}.srt" style="background:#10B981;color:white;padding:12px 20px;border-radius:8px;text-decoration:none;font-weight:bold;">📄 SRT Download (CapCut)</a>
+        </div>'''
+
         duration_sec = len(final_wav) / model.tts_model.sample_rate
         _finish_usage_job(job_id, "success", duration_sec, "")
         _, _, total_final, used_final, remaining_final = verify_vip_license(vip_key, device_fingerprint)
         usage_line = (f"📊 **VIP Usage:** **Unlimited ♾️** · Used **{used_final:,}**" if total_final == UNLIMITED_QUOTA_SENTINEL else f"📊 **VIP Usage:** **{used_final:,} / {total_final:,}** · Remaining **{remaining_final:,}**")
-        status_text = f"🎉 {auth_msg}\\n\\n✅ **MP3 အသံထုတ်လုပ်ပြီးပါပြီ!**\\n🔤 **ဒီတစ်ကြိမ်:** **{request_chars:,}** characters\\n{usage_line}\\n⏱️ **အသံကြာချိန်:** **{int(duration_sec//60)} မိနစ် {int(duration_sec%60)} စက္ကန့်**"
+        status_text = f"🎉 {auth_msg}\\n\\n✅ **အသံ + SRT ထုတ်လုပ်ပြီးပါပြီ!**\\n🔤 **ဒီတစ်ကြိမ်:** **{request_chars:,}** characters\\n{usage_line}\\n⏱️ **အသံကြာချိန်:** **{int(duration_sec//60)} မိနစ် {int(duration_sec%60)} စက္ကန့်**"
         return output_mp3_path, download_buttons_html, status_text, total_final, remaining_final, quota_counter_html("", total_final, remaining_final)
+
     except Exception as e:
         release_vip_quota(vip_key.strip(), request_chars)
         _finish_usage_job(job_id, "failed_refunded", time.time() - started, str(e))
@@ -812,11 +868,11 @@ with gr.Blocks(title="YF TTS · Burmese AI Voice Studio", theme=APP_THEME, css=A
         <div class="brand-kicker">YF TTS · Burmese AI Voice Studio</div>
         <h1>🎙️ သင့်အသံဖြင့် စာသားတိုင်းကို အသက်သွင်းပါ</h1>
         <p>စာမျက်နှာရှည် ဇာတ်ညွှန်းများနှင့် စာအုပ်များကို သင့်နမူနာအသံဖြင့်
-        MP3 အသံဖိုင်အဖြစ် ထုတ်လုပ်ပါ။</p>
+        MP3 အသံဖိုင်နှင့် SRT စာတန်းထိုးအဖြစ် ထုတ်လုပ်ပါ။</p>
         <div class="feature-row">
             <span class="feature-pill">⚡ GPU Powered</span>
             <span class="feature-pill">🎧 Voice Cloning</span>
-            <span class="feature-pill">🎵 MP3 Output</span>
+            <span class="feature-pill">📄 MP3 + SRT</span>
             <span class="feature-pill">⏱️ Long-form Ready</span>
             <span class="feature-pill">👑 VIP Access</span>
         </div>
@@ -873,7 +929,7 @@ with gr.Blocks(title="YF TTS · Burmese AI Voice Studio", theme=APP_THEME, css=A
                 )
 
             gen_btn = gr.Button(
-                "✨ အသံ စတင်ထုတ်လုပ်မည်",
+                "✨ အသံနှင့် စာတန်းထိုး စတင်ထုတ်လုပ်မည်",
                 variant="primary",
                 elem_id="generate-btn",
             )
