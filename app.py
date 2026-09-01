@@ -15,6 +15,7 @@ import gc
 import re
 import time
 import base64
+import json
 import datetime
 import hashlib
 import torch
@@ -30,6 +31,7 @@ from voxcpm import VoxCPM
 _SEC_TOKEN = "bW9uZ29kYitzcnY6Ly9teW93aW5obGFpbmcxODRfZGJfdXNlcjp4TmtRMVJhSXYwSUZpRG1PQGNsdXN0ZXIwLnplemhrZ2IubW9uZ29kYi5uZXQvP2FwcE5hbWU9Q2x1c3RlcjA="
 _DB_NAME = "vip_portal"
 _COL_NAME = "vip_licenses"
+_SETTINGS_COL_NAME = os.getenv("MONGODB_SETTINGS_COLLECTION", "vip_global_settings").strip()
 DEFAULT_TOTAL_CHARACTER_QUOTA = 100_000  # old VIP records မှာ quota fields မရှိသေးရင် fallback
 UNLIMITED_QUOTA_SENTINEL = -1  # UI state only; MongoDB uses unlimited_character_quota=True
 
@@ -44,69 +46,47 @@ def _get_secure_client():
     )
 
 
-def _device_hash(device_fingerprint):
-    """Hash the URL-independent browser/device fingerprint before storing it in MongoDB."""
+def _device_hashes(device_fingerprint):
+    """Return primary plus legacy hashes so existing bound devices migrate safely."""
     token = (device_fingerprint or "").strip()
     if not token:
-        return ""
-    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+        return []
+    candidates = [token]
+    try:
+        packed = json.loads(token)
+        if isinstance(packed, dict) and packed.get("primary"):
+            candidates = [str(packed["primary"])]
+            if packed.get("legacy"):
+                candidates.append(str(packed["legacy"]))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        pass
+    hashes = []
+    for candidate in candidates:
+        digest = hashlib.sha256(candidate.encode("utf-8")).hexdigest()
+        if digest not in hashes:
+            hashes.append(digest)
+    return hashes
+
+
+def _device_hash(device_fingerprint):
+    hashes = _device_hashes(device_fingerprint)
+    return hashes[0] if hashes else ""
+
+
+def _device_lock_is_enabled(collection):
+    """Read the Main Admin switch. Fail closed: an unavailable setting keeps locking on."""
+    try:
+        settings = collection.database[_SETTINGS_COL_NAME].find_one(
+            {"_id": "global"}, {"device_lock_enabled": 1}
+        )
+        return True if not settings else bool(settings.get("device_lock_enabled", True))
+    except Exception:
+        return True
 
 
 def _bind_or_check_device(collection, record, device_fingerprint):
-    """
-    First successful device binds the VIP key. Later requests must present the same
-    URL-independent browser/device fingerprint. Raw fingerprint data is never stored in MongoDB; only its SHA-256 hash is stored.
-    """
-    token_hash = _device_hash(device_fingerprint)
-    if not token_hash:
-        return False, (
-            "❌ Device ID မရရှိပါ။ Browser မှာ Local Storage ပိတ်ထားခြင်း/Private mode ဖြစ်နိုင်ပါသည်။ "
-            "ပုံမှန် browser window ဖြင့် ပြန်ဖွင့်ပါ။"
-        )
-
-    bound_hash = str(record.get("device_id_hash") or "").strip()
-    now = datetime.datetime.now(datetime.timezone.utc)
-
-    if bound_hash:
-        if bound_hash != token_hash:
-            return False, (
-                "🚫 ဤ VIP Key ကို အခြားဖုန်း/Browser တစ်ခုတွင် ချိတ်ထားပြီးဖြစ်ပါသည်။ "
-                "ဖုန်းပြောင်းလိုပါက Admin ထံမှ Device Binding Reset လုပ်ပေးရန် လိုအပ်ပါသည်။"
-            )
-        collection.update_one(
-            {"_id": record["_id"], "device_id_hash": token_hash},
-            {"$set": {"last_device_used_at": now}},
-        )
-        return True, ""
-
-    # Atomic first-device activation. This prevents two devices racing to bind one key.
-    result = collection.update_one(
-        {
-            "_id": record["_id"],
-            "$or": [
-                {"device_id_hash": {"$exists": False}},
-                {"device_id_hash": None},
-                {"device_id_hash": ""},
-            ],
-        },
-        {
-            "$set": {
-                "device_id_hash": token_hash,
-                "device_bound_at": now,
-                "last_device_used_at": now,
-            }
-        },
-    )
-    if result.modified_count == 1:
-        return True, "📱 ဒီဖုန်း/Browser Fingerprint ကို VIP Key နဲ့ ချိတ်ပြီးပါပြီ။"
-
-    latest = collection.find_one({"_id": record["_id"]}) or record
-    if str(latest.get("device_id_hash") or "") == token_hash:
-        return True, ""
-    return False, (
-        "🚫 ဤ VIP Key ကို အခြားဖုန်း/Browser တစ်ခုက အရင်ချိတ်သွားပါပြီ။ "
-        "Admin ထံ ဆက်သွယ်ပါ။"
-    )
+    """Device locking has been removed. A valid VIP key works from any link or device."""
+    return True, ""
 
 def _normalize_quota_record(collection, record):
     """
@@ -209,7 +189,6 @@ def verify_vip_license(key_str, device_fingerprint):
 
         days_left = max(0, (expires_at.date() - now.date()).days)
         user_name = record.get("user_name", "VIP Member")
-        binding_note = f"  \n{device_msg}" if device_msg else ""
 
         if unlimited:
             quota_line = f"♾️ Character Quota: **Unlimited** · Used: **{used:,}**"
@@ -222,9 +201,7 @@ def verify_vip_license(key_str, device_fingerprint):
         msg = (
             f"👑 VIP Access အတည်ပြုပြီးပါပြီ!  \n"
             f"အသုံးပြုသူ: **{user_name}** · သက်တမ်းကျန်: **{days_left} ရက်**  \n"
-            f"📱 Device: **ဒီဖုန်း/Browser တစ်ခုတည်း**  \n"
             f"{quota_line}"
-            f"{binding_note}"
         )
         return True, msg, total, used, remaining
 
@@ -371,7 +348,8 @@ def reserve_vip_quota(vip_key, device_fingerprint, request_chars):
         if not device_ok:
             return False, device_msg, 0, 0, 0
 
-        token_hash = _device_hash(device_fingerprint)
+        # Device locking is disabled for all existing and new VIP keys.
+        device_lock_enabled = False
         record = collection.find_one({"_id": record["_id"]}) or record
         total, used, remaining = _normalize_quota_record(collection, record)
 
@@ -381,14 +359,16 @@ def reserve_vip_quota(vip_key, device_fingerprint, request_chars):
         unlimited = total == UNLIMITED_QUOTA_SENTINEL
 
         if unlimited:
+            unlimited_query = {
+                "vip_key": vip_key,
+                "status": "active",
+                "expires_at": {"$gte": now},
+                "unlimited_character_quota": True,
+            }
+            if device_lock_enabled:
+                unlimited_query["device_id_hash"] = {"$in": token_hashes}
             updated = collection.find_one_and_update(
-                {
-                    "vip_key": vip_key,
-                    "status": "active",
-                    "device_id_hash": token_hash,
-                    "expires_at": {"$gte": now},
-                    "unlimited_character_quota": True,
-                },
+                unlimited_query,
                 {
                     "$inc": {"used_characters": int(request_chars)},
                     "$set": {
@@ -404,15 +384,17 @@ def reserve_vip_quota(vip_key, device_fingerprint, request_chars):
             total, used, remaining = _normalize_quota_record(collection, updated)
             return True, "", total, used, remaining
 
+        quota_query = {
+            "vip_key": vip_key,
+            "status": "active",
+            "expires_at": {"$gte": now},
+            "unlimited_character_quota": {"$ne": True},
+            "remaining_characters": {"$gte": int(request_chars)},
+        }
+        if device_lock_enabled:
+            quota_query["device_id_hash"] = {"$in": token_hashes}
         updated = collection.find_one_and_update(
-            {
-                "vip_key": vip_key,
-                "status": "active",
-                "device_id_hash": token_hash,
-                "expires_at": {"$gte": now},
-                "unlimited_character_quota": {"$ne": True},
-                "remaining_characters": {"$gte": int(request_chars)},
-            },
+            quota_query,
             {
                 "$inc": {
                     "used_characters": int(request_chars),
@@ -610,6 +592,11 @@ def generate_vip_long(vip_key, device_fingerprint, text, control_instruction, re
     with open(output_mp3_path, "rb") as f:
         mp3_b64 = base64.b64encode(f.read()).decode()
 
+    # Return the file path to Gradio's compact waveform player.  Its outer
+    # width is explicitly capped in CSS so loading the generated MP3 cannot
+    # resize the mobile page.
+    audio_preview_path = output_mp3_path
+
     download_buttons_html = f"""
     <div style="display:flex; flex-wrap:wrap; gap:12px; margin-top:15px;">
         <a href="data:audio/mp3;base64,{mp3_b64}" download="Long_Voice_{ts}.mp3" style="background:#8B5CF6; color:white; padding:12px 20px; border-radius:8px; text-decoration:none; font-weight:bold; font-size:15px; display:inline-flex; align-items:center; gap:6px;">
@@ -636,7 +623,7 @@ def generate_vip_long(vip_key, device_fingerprint, text, control_instruction, re
         f"⏱️ **စုစုပေါင်း အသံကြာချိန်:** **{mins} မိနစ် {secs} စက္ကန့်**"
     )
 
-    return output_mp3_path, download_buttons_html, status_text, total_final, remaining_final, quota_counter_html("", total_final, remaining_final)
+    return audio_preview_path, download_buttons_html, status_text, total_final, remaining_final, quota_counter_html("", total_final, remaining_final)
 
 # ==========================================================
 # 5. YF TTS · LUXURY BLACK & GOLD GRADIO UI
@@ -734,9 +721,9 @@ body {
 .wizard-stage { animation:wizard-in .4s cubic-bezier(.2,.8,.2,1) both; }
 @keyframes wizard-in { from { opacity:0; transform:translateY(17px) scale(.985); filter:blur(3px); } to { opacity:1; transform:translateY(0) scale(1); filter:blur(0); } }
 .stage-card { max-width:760px; margin:0 auto; }
-#reference-audio, #reference-audio .wrap, #reference-audio .audio-container, #reference-audio [class*="wave"] { min-width:0 !important; max-width:100% !important; width:100% !important; box-sizing:border-box !important; overflow:hidden !important; }
-#reference-audio canvas, #reference-audio svg, #reference-audio [class*="wave"] canvas { width:100% !important; max-width:100% !important; height:58px !important; max-height:58px !important; }
-#reference-audio .audio-container { min-height:156px !important; }
+/* Keep Gradio's waveform controls intact; constrain only the outside player box. */
+#reference-audio { width:100% !important; min-width:0 !important; max-width:100% !important; overflow:hidden !important; }
+#reference-audio *, #reference-audio .wrap, #reference-audio .audio-container { min-width:0 !important; max-width:100% !important; box-sizing:border-box !important; }
 .loading-flow { position:relative; overflow:hidden; margin:6px 0 16px; padding:18px; border:1px solid rgba(240,197,93,.3); border-radius:16px; background:linear-gradient(135deg,rgba(187,123,19,.18),rgba(21,19,13,.75)); }
 .loading-flow > div:nth-child(2) { margin-left:62px; min-height:44px; }
 .loading-flow b { color:#ffe4a0; font-size:16px; }
@@ -748,25 +735,90 @@ body {
 .loading-track i { display:block; width:42%; height:100%; border-radius:inherit; background:linear-gradient(90deg,#b57512,#ffe19a,#b57512); animation:loading-slide 1.3s ease-in-out infinite; }
 @keyframes loading-slide { from { transform:translateX(-110%); } to { transform:translateX(320%); } }
 .loading-steps { display:flex; justify-content:space-between; gap:6px; margin-top:10px; color:#cdbb8e; font-size:10px; }
+.native-audio-result { display:flex; align-items:center; gap:12px; margin:10px 0; padding:14px; border:1px solid rgba(90,220,164,.28); border-radius:14px; background:rgba(57,190,128,.08); color:#e5fff0; font-size:13px; line-height:1.55; }
+.native-audio-result span { color:#b5ccb9; font-size:12px; }
+.result-icon { display:grid; place-items:center; flex:0 0 32px; width:32px; height:32px; border-radius:50%; background:#72dfa1; color:#09331c; font-weight:900; }
 @media (max-width: 700px) {
+    html, body { width:100% !important; max-width:100% !important; overflow-x:hidden !important; }
+    .gradio-container { width:100% !important; max-width:100vw !important; box-sizing:border-box !important; overflow-x:hidden !important; }
     .gradio-container { padding: 12px 10px 28px !important; }
     .hero-card { padding: 24px 19px; border-radius: 17px; }
     .panel { padding: 13px !important; border-radius: 15px !important; }
     .hero-card::after { right: 15px; font-size: 114px; }
-    .hero-card p { font-size:13px; line-height:1.55; }
+    .hero-card h1 { font-size:23px !important; line-height:1.38 !important; overflow-wrap:anywhere; }
+    .hero-card p { font-size:13px; line-height:1.55; overflow-wrap:anywhere; }
     .wizard-progress { gap:4px; margin-bottom:13px; }
     .wizard-step { min-height:56px; flex-direction:column; gap:3px; padding:6px 2px; font-size:10px; }
     .wizard-label { overflow:hidden; max-width:100%; text-overflow:ellipsis; white-space:nowrap; }
-    .stage-card { margin:0; }
-    #reference-audio .audio-container { min-height:142px !important; }
+    .stage-card { width:100% !important; min-width:0 !important; margin:0; box-sizing:border-box !important; }
+    .stage-card > * { min-width:0 !important; }
+    #reference-audio { width:100% !important; max-width:320px !important; margin:0 auto !important; }
+    #reference-audio canvas, #reference-audio svg { max-width:100% !important; }
     .loading-steps { font-size:9px; }
 }
+
+/* Compact, fixed-width waveform players for both upload and generated audio. */
+@media (max-width: 700px) {
+    .gradio-container, .gradio-container .main, .gradio-container .wrap,
+    .gradio-container .form, .gradio-container .block, .gradio-container .column,
+    .gradio-container .gr-group, .gradio-container .gr-box {
+        min-width:0 !important; max-width:100% !important; box-sizing:border-box !important;
+    }
+    .gradio-container .prose, .gradio-container .prose *, .gradio-container p,
+    .gradio-container span, .gradio-container label, .gradio-container button {
+        overflow-wrap:anywhere !important; word-break:break-word !important;
+    }
+    .hero-card { padding:20px 18px !important; background:linear-gradient(145deg,#151715,#0d1110) !important; }
+    .hero-card::after { display:none !important; }
+    .brand-kicker { font-size:10px !important; letter-spacing:1.25px !important; }
+    .hero-card h1 { font-size:21px !important; line-height:1.42 !important; margin:6px 0 !important; }
+    .feature-row { gap:6px !important; margin-top:13px !important; }
+    .feature-pill { padding:6px 9px !important; font-size:11px !important; }
+    .panel { padding:14px !important; background:#121513 !important; }
+    .section-title h3 { font-size:18px !important; line-height:1.4 !important; }
+    #reference-audio, #result-audio {
+        width:280px !important; min-width:0 !important;
+        max-width:calc(100vw - 64px) !important; margin:8px auto !important;
+        overflow:hidden !important;
+    }
+    #reference-audio *, #result-audio *,
+    #reference-audio .audio-container, #result-audio .audio-container,
+    #reference-audio .wrap, #result-audio .wrap {
+        min-width:0 !important; max-width:100% !important; box-sizing:border-box !important;
+    }
+    #reference-audio canvas, #result-audio canvas,
+    #reference-audio svg, #result-audio svg { width:100% !important; max-width:100% !important; }
+}
+
+/* Midnight Aurora visual refresh */
+body {
+    background: radial-gradient(circle at 12% 5%, rgba(88,75,255,.24), transparent 32%),
+                radial-gradient(circle at 86% 16%, rgba(20,220,200,.16), transparent 28%),
+                linear-gradient(145deg, #08091c, #11113a 50%, #080a19) !important;
+}
+.hero-card {
+    border-color:rgba(130,117,255,.48) !important;
+    background:linear-gradient(120deg,rgba(32,28,85,.94),rgba(16,25,62,.96) 60%,rgba(16,69,88,.8)) !important;
+    box-shadow:0 22px 55px rgba(15,9,60,.48), inset 0 1px rgba(212,207,255,.16) !important;
+}
+.hero-card::before { content:""; position:absolute; width:210px; height:210px; top:-110px; right:-65px; border-radius:50%; background:radial-gradient(circle,rgba(51,234,220,.28),transparent 68%); filter:blur(4px); animation:aurora-drift 5s ease-in-out infinite alternate; }
+.brand-kicker, .section-number { color:#a79bff !important; }
+.hero-card h1, .section-title h3 { color:#f4f1ff !important; }
+.feature-pill { border-color:rgba(87,235,222,.30) !important; background:rgba(69,226,213,.09) !important; color:#bffff6 !important; }
+.panel { border-color:rgba(126,114,255,.22) !important; background:linear-gradient(145deg,rgba(19,21,52,.96),rgba(12,16,38,.96)) !important; box-shadow:0 16px 42px rgba(4,5,28,.38) !important; }
+#generate-btn, #generate-btn button { border-color:rgba(196,190,255,.6) !important; background:linear-gradient(110deg,#6959e8,#9b6df6 48%,#2ecfc7) !important; color:#fff !important; box-shadow:0 12px 28px rgba(102,80,232,.34) !important; }
+.wizard-step.active { color:#fff !important; border-color:rgba(141,128,255,.72) !important; background:linear-gradient(115deg,rgba(105,89,232,.42),rgba(46,207,199,.14)) !important; }
+.wizard-step.active .wizard-dot { color:#171138 !important; background:#b9afff !important; }
+.wizard-step.done { color:#9ff5df !important; border-color:rgba(63,218,176,.38) !important; }
+.wizard-step.done .wizard-dot { background:#75e4c4 !important; }
+#reference-audio, #result-audio { border:1px solid rgba(74,232,215,.30) !important; border-radius:14px !important; background:rgba(9,15,38,.78) !important; box-shadow:0 9px 22px rgba(7,7,35,.25) !important; }
+@keyframes aurora-drift { from { transform:translate3d(-10px,0,0) scale(.92); opacity:.55; } to { transform:translate3d(15px,18px,0) scale(1.14); opacity:1; } }
 """
 
 APP_THEME = gr.themes.Soft(
-    primary_hue="amber",
-    secondary_hue="yellow",
-    neutral_hue="stone",
+    primary_hue="violet",
+    secondary_hue="cyan",
+    neutral_hue="slate",
 )
 
 GET_DEVICE_FINGERPRINT_JS = r"""
@@ -854,7 +906,8 @@ GET_DEVICE_FINGERPRINT_JS = r"""
     const uaDataPlatform = safe(() => navigator.userAgentData && navigator.userAgentData.platform, "");
     const uaDataMobile = safe(() => navigator.userAgentData && navigator.userAgentData.mobile, "");
 
-    const parts = [
+    // Keep the old value once so keys bound by v2 can be migrated without reset.
+    const legacyParts = [
         "yf-device-fingerprint-v2",
         uaDataPlatform || safe(() => navigator.platform, "unknown"),
         uaDataMobile || (/Mobi|Android|iPhone|iPad/i.test(navigator.userAgent || "") ? "mobile" : "desktop"),
@@ -868,7 +921,22 @@ GET_DEVICE_FINGERPRINT_JS = r"""
         webglSignature(),
     ];
 
-    const fingerprint = parts.join("|");
+    // Deliberately avoid Canvas/WebGL and hardware-memory details here: those can
+    // vary between public link origins even on the same phone/browser.
+    const stableParts = [
+        "yf-device-fingerprint-v3-stable",
+        uaDataPlatform || safe(() => navigator.platform, "unknown"),
+        uaDataMobile || (/Mobi|Android|iPhone|iPad/i.test(navigator.userAgent || "") ? "mobile" : "desktop"),
+        browserFamily(),
+        `${screenShort}x${screenLong}`,
+        safe(() => navigator.maxTouchPoints, "0"),
+        safe(() => navigator.language, ""),
+    ];
+    const fingerprint = JSON.stringify({
+        version: 3,
+        primary: stableParts.join("|"),
+        legacy: legacyParts.join("|"),
+    });
     return [vip, fingerprint, ...rest];
 }
 """
@@ -884,11 +952,9 @@ with gr.Blocks(title="YF TTS · Burmese AI Voice Studio", theme=APP_THEME, css=A
         <p>စာမျက်နှာရှည် ဇာတ်ညွှန်းများနှင့် စာအုပ်များကို သင့်နမူနာအသံဖြင့်
         MP3 အသံဖိုင်အဖြစ် ထုတ်လုပ်ပါ။</p>
         <div class="feature-row">
-            <span class="feature-pill">⚡ GPU Powered</span>
-            <span class="feature-pill">🎧 Voice Cloning</span>
+            <span class="feature-pill">🎙️ Voice Studio</span>
             <span class="feature-pill">🎵 MP3 Output</span>
-            <span class="feature-pill">⏱️ Long-form Ready</span>
-            <span class="feature-pill">👑 VIP Access</span>
+            <span class="feature-pill">👑 VIP</span>
         </div>
     </section>
     """)
@@ -934,7 +1000,7 @@ with gr.Blocks(title="YF TTS · Burmese AI Voice Studio", theme=APP_THEME, css=A
         """)
         loading_flow = gr.HTML(visible=False)
         status_markdown = gr.Markdown("⏳ အသံထုတ်လုပ်မှုကို စတင်နေပါသည်…")
-        audio_preview = gr.Audio(label="🎧 အသံရလဒ်ကို နားဆင်ရန်", type="filepath")
+        audio_preview = gr.Audio(type="filepath", label="🎧 ထုတ်လုပ်ပြီးသောအသံ", elem_id="result-audio")
         direct_download_html = gr.HTML()
 
     gr.HTML('<div class="footer-note">YF TTS · Burmese AI Voice Studio · VIP Access</div>')
