@@ -367,11 +367,34 @@ def open_result_step():
         gr.update(visible=False), gr.update(visible=True), wizard_progress_html(4),
         gr.update(value=loading_flow_html(), visible=True),
         "⏳ အသံဖိုင်ကို ပြုလုပ်နေပါသည်…",
+        gr.update(interactive=False),
     )
 
 
 def hide_loading_flow():
     return gr.update(visible=False)
+
+
+def finish_generation_ui():
+    return gr.update(visible=False), gr.update(interactive=True)
+
+
+def start_another_generation(total_quota, remaining_quota):
+    """Return to STEP 02 while keeping the already-verified VIP session."""
+    return (
+        gr.update(visible=False),              # result_step
+        gr.update(visible=True),               # text_step
+        gr.update(visible=False),              # voice_step
+        wizard_progress_html(2),
+        "",                                   # text_in
+        quota_counter_html("", total_quota, remaining_quota),
+        "",                                   # text_step_status
+        None,                                 # audio_preview
+        "",                                   # direct_download_html
+        "စာသားအသစ်ကို ထည့်ပြီး နောက်တစ်ပုဒ် စတင်နိုင်ပါပြီ။",
+        gr.update(visible=False),              # loading_flow
+        None,                                 # audio_in
+    )
 
 
 def update_quota_counter(text, total_quota, remaining_quota):
@@ -1080,6 +1103,7 @@ with gr.Blocks(title="YF TTS · Burmese AI Voice Studio", theme=APP_THEME, css=A
         status_markdown = gr.Markdown("⏳ အသံထုတ်လုပ်မှုကို စတင်နေပါသည်…")
         audio_preview = gr.Audio(type="filepath", label="🎧 ထုတ်လုပ်ပြီးသောအသံ", elem_id="result-audio")
         direct_download_html = gr.HTML()
+        another_btn = gr.Button("➕ နောက်ထပ်အသံတစ်ပုဒ် ထုတ်မည်", variant="primary", elem_id="generate-btn")
 
     gr.HTML('<div class="footer-note">YF TTS · Burmese AI Voice Studio · VIP Access</div>')
 
@@ -1111,7 +1135,7 @@ with gr.Blocks(title="YF TTS · Burmese AI Voice Studio", theme=APP_THEME, css=A
 
     generation_event = gen_btn.click(
         fn=open_result_step,
-        outputs=[voice_step, result_step, wizard_progress, loading_flow, status_markdown],
+        outputs=[voice_step, result_step, wizard_progress, loading_flow, status_markdown, another_btn],
     )
     generation_done = generation_event.then(
         fn=generate_vip_long,
@@ -1119,7 +1143,18 @@ with gr.Blocks(title="YF TTS · Burmese AI Voice Studio", theme=APP_THEME, css=A
         outputs=[audio_preview, direct_download_html, status_markdown, vip_total_quota, vip_remaining_quota, char_counter],
         js=GET_DEVICE_FINGERPRINT_JS,
     )
-    generation_done.then(fn=hide_loading_flow, outputs=[loading_flow])
+    generation_done.then(fn=finish_generation_ui, outputs=[loading_flow, another_btn])
+
+    another_btn.click(
+        fn=start_another_generation,
+        inputs=[vip_total_quota, vip_remaining_quota],
+        outputs=[
+            result_step, text_step, voice_step, wizard_progress,
+            text_in, char_counter, text_step_status,
+            audio_preview, direct_download_html, status_markdown,
+            loading_flow, audio_in,
+        ],
+    )
 
 # ==========================================================
 # 6. GOOGLE COLAB + CLOUDFLARE QUICK TUNNEL LAUNCHER (FIXED)
