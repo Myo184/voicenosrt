@@ -75,6 +75,7 @@ import json
 import datetime
 import hashlib
 import traceback
+import unicodedata
 import torch
 import numpy as np
 import soundfile as sf
@@ -89,6 +90,7 @@ _SEC_TOKEN = "bW9uZ29kYitzcnY6Ly9teW93aW5obGFpbmcxODRfZGJfdXNlcjp4TmtRMVJhSXYwSU
 _DB_NAME = "vip_portal"
 _COL_NAME = "vip_licenses"
 _SETTINGS_COL_NAME = os.getenv("MONGODB_SETTINGS_COLLECTION", "vip_global_settings").strip()
+_USAGE_COL_NAME = os.getenv("MONGODB_USAGE_COLLECTION", "vip_usage_history").strip()
 DEFAULT_TOTAL_CHARACTER_QUOTA = 100_000  # old VIP records မှာ quota fields မရှိသေးရင် fallback
 UNLIMITED_QUOTA_SENTINEL = -1  # UI state only; MongoDB uses unlimited_character_quota=True
 
@@ -113,8 +115,11 @@ def _device_hashes(device_fingerprint):
         packed = json.loads(token)
         if isinstance(packed, dict) and packed.get("primary"):
             candidates = [str(packed["primary"])]
-            if packed.get("legacy"):
-                candidates.append(str(packed["legacy"]))
+            legacy = packed.get("legacy")
+            if isinstance(legacy, (list, tuple)):
+                candidates.extend(str(v) for v in legacy if v)
+            elif legacy:
+                candidates.append(str(legacy))
     except (TypeError, ValueError, json.JSONDecodeError):
         pass
     hashes = []
@@ -130,20 +135,86 @@ def _device_hash(device_fingerprint):
     return hashes[0] if hashes else ""
 
 
-def _device_lock_is_enabled(collection):
-    """Read the Main Admin switch. Fail closed: an unavailable setting keeps locking on."""
+def _runtime_settings(collection):
+    """Read shared runtime switches from the Admin portal settings collection."""
+    defaults = {
+        "device_lock_enabled": True,
+        "maintenance_mode": False,
+        "maintenance_message": "System maintenance လုပ်နေပါသည်။ ခဏနောက်မှ ပြန်စမ်းပါ။",
+    }
     try:
-        settings = collection.database[_SETTINGS_COL_NAME].find_one(
-            {"_id": "global"}, {"device_lock_enabled": 1}
-        )
-        return True if not settings else bool(settings.get("device_lock_enabled", True))
+        settings = collection.database[_SETTINGS_COL_NAME].find_one({"_id": "global"}) or {}
+        result = dict(defaults)
+        result.update({k: settings.get(k, v) for k, v in defaults.items()})
+        result["device_lock_enabled"] = True  # Voice VIP device lock is mandatory
+        result["maintenance_mode"] = bool(result["maintenance_mode"])
+        result["maintenance_message"] = str(result.get("maintenance_message") or defaults["maintenance_message"])
+        return result
     except Exception:
-        return True
+        return defaults
+
+
+def _device_lock_is_enabled(collection):
+    # Voice VIP is intentionally one browser/device only. Admin reset releases a key.
+    return True
+
+
+def _maintenance_block(collection):
+    settings = _runtime_settings(collection)
+    if settings.get("maintenance_mode"):
+        return True, str(settings.get("maintenance_message") or "System maintenance လုပ်နေပါသည်။ ခဏနောက်မှ ပြန်စမ်းပါ။")
+    return False, ""
 
 
 def _bind_or_check_device(collection, record, device_fingerprint):
-    """Device locking has been removed. A valid VIP key works from any link or device."""
-    return True, ""
+    """Bind a VIP key to the first device when the Admin Device Lock switch is ON."""
+    if not _device_lock_is_enabled(collection):
+        return True, ""
+
+    token_hashes = _device_hashes(device_fingerprint)
+    if not token_hashes:
+        return False, "❌ Device ID မရရှိပါ။ Browser ကို refresh လုပ်ပြီး VIP Key ကို ပြန် Verify လုပ်ပါ။"
+
+    primary_hash = token_hashes[0]
+    saved_hash = str(record.get("device_id_hash") or "").strip()
+    now = datetime.datetime.now(datetime.timezone.utc)
+
+    if saved_hash:
+        if saved_hash not in token_hashes:
+            return False, "❌ ဤ VIP Key သည် အခြား Device တွင် ချိတ်ဆက်ပြီးသားဖြစ်ပါသည်။ Admin ထံမှ Device Reset တောင်းပါ။"
+        # Migrate a legacy hash to the current primary fingerprint if needed.
+        collection.update_one(
+            {"_id": record["_id"]},
+            {"$set": {"device_id_hash": primary_hash, "last_device_used_at": now}},
+        )
+        return True, ""
+
+    # First device wins atomically. If another request binds first, reload and compare.
+    updated = collection.find_one_and_update(
+        {
+            "_id": record["_id"],
+            "$or": [
+                {"device_id_hash": {"$exists": False}},
+                {"device_id_hash": ""},
+                {"device_id_hash": None},
+            ],
+        },
+        {
+            "$set": {
+                "device_id_hash": primary_hash,
+                "device_bound_at": now,
+                "last_device_used_at": now,
+            }
+        },
+        return_document=True,
+    )
+    if updated:
+        return True, "✅ Device Registered"
+
+    latest = collection.find_one({"_id": record["_id"]}, {"device_id_hash": 1}) or {}
+    if str(latest.get("device_id_hash") or "") in token_hashes:
+        return True, ""
+    return False, "❌ ဤ VIP Key သည် အခြား Device တွင် ချိတ်ဆက်ပြီးသားဖြစ်ပါသည်။ Admin ထံမှ Device Reset တောင်းပါ။"
 
 def _normalize_quota_record(collection, record):
     """
@@ -219,6 +290,10 @@ def verify_vip_license(key_str, device_fingerprint):
     try:
         client = _get_secure_client()
         collection = client[_DB_NAME][_COL_NAME]
+        maintenance_on, maintenance_message = _maintenance_block(collection)
+        if maintenance_on:
+            return False, f"🛠️ {maintenance_message}", 0, 0, 0
+
         record = collection.find_one({"vip_key": clean_key})
 
         if not record:
@@ -413,6 +488,10 @@ def reserve_vip_quota(vip_key, device_fingerprint, request_chars):
     try:
         client = _get_secure_client()
         collection = client[_DB_NAME][_COL_NAME]
+        maintenance_on, maintenance_message = _maintenance_block(collection)
+        if maintenance_on:
+            return False, f"🛠️ {maintenance_message}", 0, 0, 0
+
         record = collection.find_one({"vip_key": vip_key})
         if not record:
             return False, "❌ VIP Key မတွေ့ပါ။ သက်တမ်းကုန်ပြီး Auto Delete ဖြစ်ထားနိုင်ပါသည်။", 0, 0, 0
@@ -428,8 +507,8 @@ def reserve_vip_quota(vip_key, device_fingerprint, request_chars):
         if not device_ok:
             return False, device_msg, 0, 0, 0
 
-        # Device locking is disabled for all existing and new VIP keys.
-        device_lock_enabled = False
+        device_lock_enabled = _device_lock_is_enabled(collection)
+        token_hashes = _device_hashes(device_fingerprint) if device_lock_enabled else []
         record = collection.find_one({"_id": record["_id"]}) or record
         total, used, remaining = _normalize_quota_record(collection, record)
 
@@ -549,6 +628,40 @@ def release_vip_quota(vip_key, request_chars):
                 pass
 
 
+def record_voice_usage(vip_key, characters, status, output_type, duration_seconds=0.0, error="", job_id=""):
+    """Best-effort audit log for the Admin Voice Usage History table."""
+    client = None
+    try:
+        client = _get_secure_client()
+        db = client[_DB_NAME]
+        vip_record = db[_COL_NAME].find_one(
+            {"vip_key": (vip_key or "").strip()},
+            {"user_name": 1, "generated_by": 1},
+        ) or {}
+        doc = {
+            "created_at": datetime.datetime.now(datetime.timezone.utc),
+            "user_name": str(vip_record.get("user_name", "VIP Member")),
+            "vip_key": (vip_key or "").strip(),
+            "characters": max(0, int(characters or 0)),
+            "status": str(status or ""),
+            "output_type": str(output_type or ""),
+            "duration_seconds": max(0.0, float(duration_seconds or 0.0)),
+            "error": str(error or "")[:4000],
+            "generated_by": str(vip_record.get("generated_by", "")),
+        }
+        if job_id:
+            doc["job_id"] = str(job_id)
+        db[_USAGE_COL_NAME].insert_one(doc)
+    except Exception as exc:
+        print(f"[USAGE LOG WARNING] {type(exc).__name__}: {exc}")
+    finally:
+        if client is not None:
+            try:
+                client.close()
+            except Exception:
+                pass
+
+
 # ==========================================================
 # 3. LOAD VOXCPM2 MODEL ON GPU
 # ==========================================================
@@ -564,31 +677,60 @@ model = VoxCPM.from_pretrained(
 )
 print("✅ VoxCPM2 Model Loaded Successfully (Ready for 30+ Mins Audio)!")
 
+def _hard_split_unicode(segment, max_chars):
+    """Split overlong Burmese text without leaving combining marks at a chunk start."""
+    segment = (segment or "").strip()
+    out = []
+    while len(segment) > max_chars:
+        window = segment[: max_chars + 1]
+        # Prefer a natural boundary near the end of the window.
+        candidates = [window.rfind(" "), window.rfind("၊"), window.rfind("-")]
+        boundary = max(candidates)
+        if boundary < max(12, int(max_chars * 0.55)):
+            boundary = max_chars
+        else:
+            boundary += 1
+
+        # Do not cut immediately before Myanmar combining marks.
+        while boundary < len(segment) and unicodedata.category(segment[boundary]).startswith("M"):
+            boundary += 1
+
+        piece = segment[:boundary].strip()
+        if piece:
+            out.append(piece)
+        segment = segment[boundary:].strip()
+    if segment:
+        out.append(segment)
+    return out
+
+
 def split_burmese_text_long(text, max_chars=90):
-    raw_sentences = re.split(r'([။၊\n?!])', text)
-    chunks, curr = [], ""
-    for item in raw_sentences:
-        curr += item
-        if item in ['။', '၊', '\n', '?', '!']:
-            if curr.strip():
-                if len(curr) > max_chars:
-                    words = curr.split(' ')
-                    sub = ""
-                    for w in words:
-                        if len(sub) + len(w) <= max_chars:
-                            sub += (" " if sub else "") + w
-                        else:
-                            if sub.strip():
-                                chunks.append(sub.strip())
-                            sub = w
-                    if sub.strip():
-                        chunks.append(sub.strip())
-                else:
-                    chunks.append(curr.strip())
-                curr = ""
-    if curr.strip():
-        chunks.append(curr.strip())
-    return [c for c in chunks if c.strip()]
+    """Sentence-aware splitter with a hard Unicode-safe fallback for Burmese text."""
+    text = (text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not text:
+        return []
+    max_chars = max(30, int(max_chars or 90))
+
+    # Keep Myanmar sentence/comma punctuation with the preceding phrase.
+    parts = re.split(r'(?<=[။၊?!])|(?<=\n)', text)
+    chunks = []
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+        if len(part) <= max_chars:
+            chunks.append(part)
+        else:
+            chunks.extend(_hard_split_unicode(part, max_chars))
+
+    # Final invariant: no non-empty chunk should remain substantially over max_chars.
+    final = []
+    for chunk in chunks:
+        if len(chunk) > max_chars + 8:
+            final.extend(_hard_split_unicode(chunk, max_chars))
+        elif chunk.strip():
+            final.append(chunk.strip())
+    return final
 
 # ==========================================================
 # 4. ULTRA LONG-TEXT GENERATION PIPELINE
@@ -600,6 +742,22 @@ def split_burmese_text_long(text, max_chars=90):
 OUTPUT_DIR = "/content/yf_tts_outputs" if os.path.isdir("/content") else os.path.abspath("yf_tts_outputs")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 MAX_CHUNK_RETRIES = 2
+MAX_SAVED_JOBS = 6
+
+
+def cleanup_generated_outputs(keep_recent=MAX_SAVED_JOBS):
+    """Keep only the newest completed MP3 jobs to avoid filling Colab storage."""
+    try:
+        files = [
+            os.path.join(OUTPUT_DIR, name)
+            for name in os.listdir(OUTPUT_DIR)
+            if name.startswith("Long_Voice_") and name.endswith(".mp3")
+        ]
+        files.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+        for old_path in files[max(1, int(keep_recent)):]:
+            _safe_remove(old_path)
+    except Exception as exc:
+        print(f"[OUTPUT CLEANUP WARNING] {type(exc).__name__}: {exc}")
 
 
 def _safe_remove(path):
@@ -660,6 +818,7 @@ def generate_vip_long(vip_key, device_fingerprint, text, control_instruction, re
 
     clean_text = text.strip()
     request_chars = len(clean_text)
+    job_id = f"voice-{int(time.time() * 1000)}-{hashlib.sha1(os.urandom(8)).hexdigest()[:10]}"
 
     # No fixed per-generation limit. Only the VIP key's remaining TOTAL quota matters.
     reserved, reserve_msg, total_quota, used_after_reserve, remaining_after_reserve = reserve_vip_quota(
@@ -796,6 +955,8 @@ def generate_vip_long(vip_key, device_fingerprint, text, control_instruction, re
             f"⚙️ **Generate + Export အချိန်:** **{elapsed_min} မိနစ် {elapsed_sec} စက္ကန့်**"
         )
 
+        record_voice_usage(vip_key, request_chars, "success", "MP3", time.time() - start_all, "", job_id)
+        cleanup_generated_outputs()
         progress(1.0, desc="✅ MP3 အဆင်သင့်ဖြစ်ပါပြီ")
         return (
             output_mp3_path,
@@ -809,6 +970,7 @@ def generate_vip_long(vip_key, device_fingerprint, text, control_instruction, re
     except Exception as exc:
         # Never charge the user for a generation that does not produce a complete MP3.
         release_vip_quota(vip_key.strip(), request_chars)
+        record_voice_usage(vip_key, request_chars, "failed_refunded", "MP3", time.time() - start_all, f"{type(exc).__name__}: {exc}", job_id)
         _, _, total2, used2, remaining2 = verify_vip_license(vip_key, device_fingerprint)
         trace_lines = traceback.format_exc().strip().splitlines()[-12:]
         short_trace = "\n".join(trace_lines)
@@ -1130,9 +1292,11 @@ GET_DEVICE_FINGERPRINT_JS = r"""
         webglSignature(),
     ];
 
-    // Deliberately avoid Canvas/WebGL and hardware-memory details here: those can
-    // vary between public link origins even on the same phone/browser.
-    const stableParts = [
+    // v4: stronger browser/device signature. It remains URL-independent so a
+    // temporary Cloudflare/Gradio link change does not automatically release the key.
+    // Browser APIs cannot expose IMEI/serial numbers, so this is a browser fingerprint,
+    // not a guaranteed physical-hardware identifier.
+    const v3StableParts = [
         "yf-device-fingerprint-v3-stable",
         uaDataPlatform || safe(() => navigator.platform, "unknown"),
         uaDataMobile || (/Mobi|Android|iPhone|iPad/i.test(navigator.userAgent || "") ? "mobile" : "desktop"),
@@ -1141,10 +1305,27 @@ GET_DEVICE_FINGERPRINT_JS = r"""
         safe(() => navigator.maxTouchPoints, "0"),
         safe(() => navigator.language, ""),
     ];
+    const stableParts = [
+        "yf-device-fingerprint-v4",
+        uaDataPlatform || safe(() => navigator.platform, "unknown"),
+        uaDataMobile || (/Mobi|Android|iPhone|iPad/i.test(navigator.userAgent || "") ? "mobile" : "desktop"),
+        browserFamily(),
+        `${screenShort}x${screenLong}`,
+        safe(() => screen.colorDepth, "0"),
+        safe(() => window.devicePixelRatio, "1"),
+        safe(() => navigator.hardwareConcurrency, "0"),
+        safe(() => navigator.deviceMemory, "0"),
+        safe(() => navigator.maxTouchPoints, "0"),
+        safe(() => navigator.language, ""),
+        safe(() => (navigator.languages || []).join(","), ""),
+        safe(() => Intl.DateTimeFormat().resolvedOptions().timeZone, ""),
+        canvasSignature(),
+        webglSignature(),
+    ];
     const fingerprint = JSON.stringify({
-        version: 3,
+        version: 4,
         primary: stableParts.join("|"),
-        legacy: legacyParts.join("|"),
+        legacy: [v3StableParts.join("|"), legacyParts.join("|")],
     });
     return [vip, fingerprint, ...rest];
 }
