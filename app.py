@@ -390,7 +390,7 @@ def start_another_generation(total_quota, remaining_quota):
         quota_counter_html("", total_quota, remaining_quota),
         "",                                   # text_step_status
         None,                                 # audio_preview
-        "",                                   # direct_download_html
+        gr.update(value=None, visible=False),  # download_button
         "စာသားအသစ်ကို ထည့်ပြီး နောက်တစ်ပုဒ် စတင်နိုင်ပါပြီ။",
         gr.update(visible=False),              # loading_flow
         None,                                 # audio_in
@@ -593,138 +593,240 @@ def split_burmese_text_long(text, max_chars=90):
 # ==========================================================
 # 4. ULTRA LONG-TEXT GENERATION PIPELINE
 # ==========================================================
-def generate_vip_long(vip_key, device_fingerprint, text, control_instruction, reference_audio, use_reference_transcript, reference_text, clone_strength, progress=gr.Progress()):
-    is_valid, auth_msg, total_quota, used_before, remaining_before = verify_vip_license(vip_key, device_fingerprint)
+# Result files are stored as real files and served by Gradio.
+# IMPORTANT: do NOT Base64-embed the MP3 into HTML.  Embedding a whole MP3 in
+# the event response makes the browser wait for a very large JSON/HTML payload
+# before the waveform can read metadata, which is why the player can sit at 0:00.
+OUTPUT_DIR = "/content/yf_tts_outputs" if os.path.isdir("/content") else os.path.abspath("yf_tts_outputs")
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+MAX_CHUNK_RETRIES = 2
+
+
+def _safe_remove(path):
+    try:
+        if path and os.path.exists(path):
+            os.remove(path)
+    except OSError:
+        pass
+
+
+def _make_chunk_audio(full_chunk_text, reference_audio, prompt_text, clone_strength, use_prompt_text):
+    """Generate one VoxCPM chunk and normalize it to a clean mono float32 array."""
+    if use_prompt_text and prompt_text:
+        wav = model.generate(
+            text=full_chunk_text,
+            prompt_wav_path=reference_audio,
+            prompt_text=prompt_text,
+            reference_wav_path=reference_audio,
+            cfg_value=float(clone_strength),
+        )
+    else:
+        wav = model.generate(
+            text=full_chunk_text,
+            reference_wav_path=reference_audio,
+            cfg_value=float(clone_strength),
+        )
+
+    wav = np.asarray(wav, dtype=np.float32).squeeze()
+    if wav.size == 0:
+        raise RuntimeError("VoxCPM returned an empty audio array")
+    if wav.ndim != 1:
+        wav = wav.reshape(-1)
+    if not np.isfinite(wav).all():
+        wav = np.nan_to_num(wav, nan=0.0, posinf=0.0, neginf=0.0)
+    return wav
+
+
+def generate_vip_long(vip_key, device_fingerprint, text, control_instruction, reference_audio,
+                      use_reference_transcript, reference_text, clone_strength,
+                      progress=gr.Progress()):
+    is_valid, auth_msg, total_quota, used_before, remaining_before = verify_vip_license(
+        vip_key, device_fingerprint
+    )
+    hidden_download = gr.update(value=None, visible=False)
+
     if not is_valid:
-        return None, "", auth_msg, 0, 0, quota_counter_html(text, 0, 0)
+        return None, hidden_download, auth_msg, 0, 0, quota_counter_html(text, 0, 0)
 
     if not text or not text.strip() or not reference_audio:
-        return None, "", "❌ စာသားနှင့် နမူနာအသံဖိုင် ထည့်သွင်းပေးပါ", total_quota, remaining_before, quota_counter_html(text, total_quota, remaining_before)
+        return (
+            None,
+            hidden_download,
+            "❌ စာသားနှင့် နမူနာအသံဖိုင် ထည့်သွင်းပေးပါ",
+            total_quota,
+            remaining_before,
+            quota_counter_html(text, total_quota, remaining_before),
+        )
 
     clean_text = text.strip()
     request_chars = len(clean_text)
 
     # No fixed per-generation limit. Only the VIP key's remaining TOTAL quota matters.
-    reserved, reserve_msg, total_quota, used_after_reserve, remaining_after_reserve = reserve_vip_quota(vip_key.strip(), device_fingerprint, request_chars)
+    reserved, reserve_msg, total_quota, used_after_reserve, remaining_after_reserve = reserve_vip_quota(
+        vip_key.strip(), device_fingerprint, request_chars
+    )
     if not reserved:
-        return None, "", reserve_msg, total_quota, remaining_after_reserve, quota_counter_html(text, total_quota, remaining_after_reserve)
+        return (
+            None,
+            hidden_download,
+            reserve_msg,
+            total_quota,
+            remaining_after_reserve,
+            quota_counter_html(text, total_quota, remaining_after_reserve),
+        )
 
     chunks = split_burmese_text_long(clean_text, max_chars=90) or [clean_text]
-    prompt_text = reference_text if (use_reference_transcript and reference_text) else None
+    prompt_text = reference_text.strip() if (use_reference_transcript and reference_text and reference_text.strip()) else None
 
     audio_segments = []
-    generation_errors = []
-    generation_traces = []
     silence_gap = 0.15
-
+    sample_rate = int(model.tts_model.sample_rate)
+    silence_samples = int(sample_rate * silence_gap)
     total = len(chunks)
     start_all = time.time()
 
-    for idx, chunk in enumerate(chunks):
-        pct = (idx + 1) / total
-        elapsed = time.time() - start_all
-        est_total = (elapsed / (idx + 1)) * total
-        rem_sec = max(0, int(est_total - elapsed))
-        rem_min = rem_sec // 60
-
-        progress(pct, desc=f"🎙️ စာကြောင်း ({idx+1}/{total}) ထုတ်လုပ်နေပါသည်... (ခန့်မှန်းကျန်: {rem_min} မိနစ် {rem_sec%60} စက္ကန့်)")
-        full_chunk_text = f"({control_instruction}){chunk}" if control_instruction else chunk
-
-        try:
-            if prompt_text and idx == 0:
-                wav = model.generate(
-                    text=full_chunk_text,
-                    prompt_wav_path=reference_audio,
-                    prompt_text=prompt_text,
-                    reference_wav_path=reference_audio,
-                    cfg_value=float(clone_strength)
-                )
+    try:
+        for idx, chunk in enumerate(chunks):
+            # ETA is meaningful after at least one completed chunk.
+            elapsed = time.time() - start_all
+            if idx > 0:
+                avg_per_chunk = elapsed / idx
+                rem_sec = max(0, int(avg_per_chunk * (total - idx)))
             else:
-                wav = model.generate(
-                    text=full_chunk_text,
-                    reference_wav_path=reference_audio,
-                    cfg_value=float(clone_strength)
+                rem_sec = 0
+            rem_min = rem_sec // 60
+
+            progress(
+                idx / max(total, 1),
+                desc=(
+                    f"🎙️ စာကြောင်း ({idx + 1}/{total}) ထုတ်လုပ်နေပါသည်... "
+                    + (f"(ခန့်မှန်းကျန်: {rem_min} မိနစ် {rem_sec % 60} စက္ကန့်)" if idx > 0 else "")
+                ),
+            )
+
+            full_chunk_text = f"({control_instruction}){chunk}" if control_instruction else chunk
+            chunk_wav = None
+            last_error = None
+            last_trace = ""
+
+            # A failed chunk must never be silently skipped. Retry it; if every
+            # retry fails, abort the whole job and refund this generation quota.
+            for attempt in range(1, MAX_CHUNK_RETRIES + 1):
+                try:
+                    chunk_wav = _make_chunk_audio(
+                        full_chunk_text=full_chunk_text,
+                        reference_audio=reference_audio,
+                        prompt_text=prompt_text,
+                        clone_strength=clone_strength,
+                        use_prompt_text=(idx == 0),
+                    )
+                    break
+                except Exception as exc:
+                    last_error = exc
+                    last_trace = traceback.format_exc()
+                    print(
+                        f"[VOICE GENERATION RETRY] Chunk #{idx + 1} "
+                        f"attempt {attempt}/{MAX_CHUNK_RETRIES}: {type(exc).__name__}: {exc}",
+                        flush=True,
+                    )
+                    print(last_trace, flush=True)
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    if attempt < MAX_CHUNK_RETRIES:
+                        time.sleep(0.35)
+
+            if chunk_wav is None:
+                raise RuntimeError(
+                    f"Chunk #{idx + 1}/{total} failed after {MAX_CHUNK_RETRIES} attempts: "
+                    f"{type(last_error).__name__ if last_error else 'UnknownError'}: {last_error}"
                 )
 
-            audio_segments.append(wav)
-            silence_samples = int(model.tts_model.sample_rate * silence_gap)
-            audio_segments.append(np.zeros(silence_samples, dtype=np.float32))
+            audio_segments.append(chunk_wav)
+            if idx < total - 1 and silence_samples > 0:
+                audio_segments.append(np.zeros(silence_samples, dtype=np.float32))
 
-            if idx % 10 == 0:
+            # Avoid frequent cache flushing; it can slow T4 generation a lot.
+            if (idx + 1) % 8 == 0:
                 gc.collect()
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
 
-        except Exception as e:
-            error_detail = f"Chunk #{idx+1}: {type(e).__name__}: {e}"
-            error_trace = traceback.format_exc()
-            generation_errors.append(error_detail)
-            generation_traces.append(error_trace)
-            print(f"[VOICE GENERATION ERROR] {error_detail}", flush=True)
-            print(error_trace, flush=True)
-            continue
+        if not audio_segments:
+            raise RuntimeError("No audio segments were generated")
 
-    if not audio_segments:
+        progress(0.96, desc="🎧 အသံပိုင်းများကို ပေါင်းစည်းနေပါသည်...")
+        final_wav = np.concatenate(audio_segments).astype(np.float32, copy=False)
+        ts = int(time.time() * 1000)
+        temp_wav_path = os.path.join(OUTPUT_DIR, f"temp_{ts}.wav")
+        output_mp3_path = os.path.join(OUTPUT_DIR, f"Long_Voice_{ts}.mp3")
+
+        # Export MP3 once.  The MP3 remains a real file; Gradio serves it to both
+        # the waveform player and the DownloadButton without a Base64 copy.
+        sf.write(temp_wav_path, final_wav, sample_rate)
+        try:
+            audio_segment = AudioSegment.from_wav(temp_wav_path)
+            audio_segment.export(output_mp3_path, format="mp3", bitrate="192k")
+        finally:
+            _safe_remove(temp_wav_path)
+
+        if not os.path.exists(output_mp3_path) or os.path.getsize(output_mp3_path) <= 0:
+            raise RuntimeError("MP3 export failed or produced an empty file")
+
+        duration_sec = len(final_wav) / sample_rate
+        mins = int(duration_sec // 60)
+        secs = int(duration_sec % 60)
+
+        _, _, total_final, used_final, remaining_final = verify_vip_license(vip_key, device_fingerprint)
+        usage_line = (
+            f"📊 **VIP Usage:** **Unlimited ♾️** · Used **{used_final:,}**"
+            if total_final == UNLIMITED_QUOTA_SENTINEL
+            else f"📊 **VIP Usage:** **{used_final:,} / {total_final:,}** · Remaining **{remaining_final:,}**"
+        )
+
+        elapsed_total = int(time.time() - start_all)
+        elapsed_min = elapsed_total // 60
+        elapsed_sec = elapsed_total % 60
+        status_text = (
+            f"🎉 {auth_msg}\n\n"
+            f"✅ **စာကြောင်းပေါင်း ({total}) ကြောင်း အပြည့်အစုံ အောင်မြင်စွာ ထုတ်လုပ်ပြီးပါပြီ!**\n"
+            f"🔤 **ဒီတစ်ကြိမ် အသုံးပြုစာလုံး:** **{request_chars:,}**\n"
+            f"{usage_line}\n"
+            f"⏱️ **စုစုပေါင်း အသံကြာချိန်:** **{mins} မိနစ် {secs} စက္ကန့်**\n"
+            f"⚙️ **Generate + Export အချိန်:** **{elapsed_min} မိနစ် {elapsed_sec} စက္ကန့်**"
+        )
+
+        progress(1.0, desc="✅ MP3 အဆင်သင့်ဖြစ်ပါပြီ")
+        return (
+            output_mp3_path,
+            gr.update(value=output_mp3_path, visible=True),
+            status_text,
+            total_final,
+            remaining_final,
+            quota_counter_html("", total_final, remaining_final),
+        )
+
+    except Exception as exc:
+        # Never charge the user for a generation that does not produce a complete MP3.
         release_vip_quota(vip_key.strip(), request_chars)
         _, _, total2, used2, remaining2 = verify_vip_license(vip_key, device_fingerprint)
-        first_error = generation_errors[0] if generation_errors else "Unknown generation error"
-        trace_lines = generation_traces[0].strip().splitlines()[-12:] if generation_traces else []
+        trace_lines = traceback.format_exc().strip().splitlines()[-12:]
         short_trace = "\n".join(trace_lines)
         error_status = (
             "❌ **အသံထုတ်လုပ်ခြင်း မအောင်မြင်ပါ။**\n\n"
-            "အသုံးပြုစာလုံး quota ကို ပြန်ဖြည့်ပေးထားပါသည်။\n\n"
-            f"**တကယ့် Error:** `{first_error}`\n\n"
+            "စာကြောင်းတစ်ပိုင်းကို ဖြတ်ကျော်ပြီး partial audio မထုတ်ထားပါ။ "
+            "ဒီတစ်ကြိမ် အသုံးပြုစာလုံး quota ကို ပြန်ဖြည့်ပေးထားပါသည်။\n\n"
+            f"**တကယ့် Error:** `{type(exc).__name__}: {exc}`\n\n"
             f"**Traceback (နောက်ဆုံး 12 လိုင်း):**\n```text\n{short_trace}\n```"
         )
-        return None, "", error_status, total2, remaining2, quota_counter_html(text, total2, remaining2)
-
-    final_wav = np.concatenate(audio_segments)
-    ts = int(time.time() * 1000)
-
-    # Export MP3
-    temp_wav_path = f"temp_{ts}.wav"
-    sf.write(temp_wav_path, final_wav, model.tts_model.sample_rate)
-    output_mp3_path = f"cloned_voice_{ts}.mp3"
-    audio_segment = AudioSegment.from_wav(temp_wav_path)
-    audio_segment.export(output_mp3_path, format="mp3", bitrate="192k")
-    if os.path.exists(temp_wav_path):
-        os.remove(temp_wav_path)
-
-    with open(output_mp3_path, "rb") as f:
-        mp3_b64 = base64.b64encode(f.read()).decode()
-
-    # Return the file path to Gradio's compact waveform player.  Its outer
-    # width is explicitly capped in CSS so loading the generated MP3 cannot
-    # resize the mobile page.
-    audio_preview_path = output_mp3_path
-
-    download_buttons_html = f"""
-    <div style="display:flex; flex-wrap:wrap; gap:12px; margin-top:15px;">
-        <a href="data:audio/mp3;base64,{mp3_b64}" download="Long_Voice_{ts}.mp3" style="background:#8B5CF6; color:white; padding:12px 20px; border-radius:8px; text-decoration:none; font-weight:bold; font-size:15px; display:inline-flex; align-items:center; gap:6px;">
-            📥 MP3 အသံဖိုင် တိုက်ရိုက်ဒေါင်းလုဒ် (.mp3)
-        </a>
-    </div>
-    """
-
-    duration_sec = len(final_wav) / model.tts_model.sample_rate
-    mins = int(duration_sec // 60)
-    secs = int(duration_sec % 60)
-
-    _, _, total_final, used_final, remaining_final = verify_vip_license(vip_key, device_fingerprint)
-    usage_line = (
-        f"📊 **VIP Usage:** **Unlimited ♾️** · Used **{used_final:,}**"
-        if total_final == UNLIMITED_QUOTA_SENTINEL
-        else f"📊 **VIP Usage:** **{used_final:,} / {total_final:,}** · Remaining **{remaining_final:,}**"
-    )
-    status_text = (
-        f"🎉 {auth_msg}\n\n"
-        f"✅ **စာကြောင်းပေါင်း ({total}) ကြောင်း အပြည့်အစုံ အောင်မြင်စွာ ထုတ်လုပ်ပြီးပါပြီ!**\n"
-        f"🔤 **ဒီတစ်ကြိမ် အသုံးပြုစာလုံး:** **{request_chars:,}**\n"
-        f"{usage_line}\n"
-        f"⏱️ **စုစုပေါင်း အသံကြာချိန်:** **{mins} မိနစ် {secs} စက္ကန့်**"
-    )
-
-    return audio_preview_path, download_buttons_html, status_text, total_final, remaining_final, quota_counter_html("", total_final, remaining_final)
+        return (
+            None,
+            hidden_download,
+            error_status,
+            total2,
+            remaining2,
+            quota_counter_html(text, total2, remaining2),
+        )
 
 # ==========================================================
 # 5. YF TTS · LUXURY BLACK & GOLD GRADIO UI
@@ -799,6 +901,12 @@ body {
     width: 100%;
 }
 #generate-btn:hover, #generate-btn button:hover { transform: translateY(-1px); filter: brightness(1.08); }
+#download-btn, #download-btn button {
+    width:100% !important;
+    min-height:48px !important;
+    border-radius:12px !important;
+    font-weight:800 !important;
+}
 .char-counter {
     margin: 8px 0 4px;
     padding: 10px 13px;
@@ -1101,8 +1209,21 @@ with gr.Blocks(title="YF TTS · Burmese AI Voice Studio", theme=APP_THEME, css=A
         """)
         loading_flow = gr.HTML(visible=False)
         status_markdown = gr.Markdown("⏳ အသံထုတ်လုပ်မှုကို စတင်နေပါသည်…")
-        audio_preview = gr.Audio(type="filepath", label="🎧 ထုတ်လုပ်ပြီးသောအသံ", elem_id="result-audio")
-        direct_download_html = gr.HTML()
+        audio_preview = gr.Audio(
+            type="filepath",
+            format="mp3",
+            autoplay=False,
+            buttons=["download"],
+            label="🎧 ထုတ်လုပ်ပြီးသောအသံ",
+            elem_id="result-audio",
+        )
+        download_button = gr.DownloadButton(
+            "📥 MP3 အသံဖိုင် တိုက်ရိုက်ဒေါင်းလုဒ် (.mp3)",
+            value=None,
+            visible=False,
+            variant="primary",
+            elem_id="download-btn",
+        )
         another_btn = gr.Button("➕ နောက်ထပ်အသံတစ်ပုဒ် ထုတ်မည်", variant="primary", elem_id="generate-btn")
 
     gr.HTML('<div class="footer-note">YF TTS · Burmese AI Voice Studio · VIP Access</div>')
@@ -1140,7 +1261,7 @@ with gr.Blocks(title="YF TTS · Burmese AI Voice Studio", theme=APP_THEME, css=A
     generation_done = generation_event.then(
         fn=generate_vip_long,
         inputs=[vip_key, device_fingerprint, text_in, control_in, audio_in, use_transcript, ref_text_in, clone_str],
-        outputs=[audio_preview, direct_download_html, status_markdown, vip_total_quota, vip_remaining_quota, char_counter],
+        outputs=[audio_preview, download_button, status_markdown, vip_total_quota, vip_remaining_quota, char_counter],
         js=GET_DEVICE_FINGERPRINT_JS,
     )
     generation_done.then(fn=finish_generation_ui, outputs=[loading_flow, another_btn])
@@ -1151,7 +1272,7 @@ with gr.Blocks(title="YF TTS · Burmese AI Voice Studio", theme=APP_THEME, css=A
         outputs=[
             result_step, text_step, voice_step, wizard_progress,
             text_in, char_counter, text_step_status,
-            audio_preview, direct_download_html, status_markdown,
+            audio_preview, download_button, status_markdown,
             loading_flow, audio_in,
         ],
     )
